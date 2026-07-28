@@ -1,0 +1,16 @@
+# These examples use only the Python standard library, with one exception below.
+#
+# When listing required packages, it is strongly recommended to pin them to
+# a specific version.  Your image is rebuilt from time to time, and an
+# unpinned dependency may mean a rebuild results in unexpected plugin behaviour.
+#
+#     pandas==2.2.2
+#     numpy==1.26.4
+
+# Timezone database, needed by zoneinfo.ZoneInfo (as used in well_behaved.py, which
+# reports its finish time in Melbourne local time).
+#
+# Minimal base images such as python:3-slim do NOT ship the system timezone database,
+# so must be added here.  This also serves as a trivial example of how your plugins
+# may define additional Python libraries required for your code to run.
+tzdata==2025.2
