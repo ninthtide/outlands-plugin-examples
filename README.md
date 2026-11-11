@@ -24,8 +24,29 @@ database), but has no network access of its own.
 | Path | Access | What it holds |
 |---|---|---|
 | `/in` | read-only | `params.json`, plus any datasets you subscribed to |
-| `/out` | writable | location for all plugin output |
-| `/tmp` | writable | scratch space, small, discarded |
+| `/out` | writable, size-capped | location for all plugin output; collected after the run |
+| `/scratch` | writable, size-capped, private | optional: intermediate files between the stages of one run; discarded after the run, never collected |
+| `/tmp` | writable, small | temporary files; held in RAM, so it counts against your memory budget; discarded |
+
+Nothing else is writable: the rest of the filesystem is read-only. `HOME` is set to `/tmp`.
+`/out`, `/scratch` and `/tmp` won't execute anything.
+
+`/scratch` is opt-in: ask for it, with a size, when your plugin is onboarded. Anything left
+in `/out` at the end that isn't a declared output fails the job, so `/scratch` is the place
+for working files you don't want back.
+
+### Who your code runs as
+
+- A numeric user id in the range 3000-3999, with the group id the same number. There is no
+  username, no `/etc/passwd` entry and no other groups. Any `USER` in your image is
+  overridden.
+- `/in`, `/out` and `/scratch` are handed to that user before your container starts, so
+  you can always read `/in` and write the others, whatever the number is.
+- Your own files inside the image must be world-readable (and world-executable for
+  programs and directories), e.g. `RUN chmod -R a+rX /app`. Group permissions don't help,
+  because you won't be in your image's group. Make your `WORKDIR` world-readable too, or
+  anything using relative paths will fail.
+- If you'd rather build against one fixed number, ask at onboarding and we'll pin it.
 
 **There is no network.** Your container cannot reach the internet, the main
 database, or anything else. You cannot fetch a file, call an API, or install a
@@ -169,7 +190,16 @@ the retention rules, please discuss with the SmartRainGrid development team.
 ### Print freely to terminal/stdout
 
 Anything your program prints to the terminal standard output (stdout) is captured into the
-job log, for later download and review.
+job log, for later download and review.  Output is streamed while your job runs, so the log
+can be viewed live, or maybe reviewed once the job has finished, as you wish.
+
+**If you are writing in Python this works automatically** — the platform runs your container
+with `PYTHONUNBUFFERED=1`.
+
+**In any other language, you will need to flush your output.** Most runtimes buffer stdout
+when it is not attached to a terminal, which includes how your plugin is deployed to Outlands.
+If you do not flush your output, your messages will remain in your own process's buffer for
+a long time before being sent to SmartRainGrid and being visible in the Research Centre.
 
 ---
 
@@ -218,7 +248,20 @@ script at them instead of `/in` and `/out`, and run it directly. That is the fas
 loop available to you and it catches most mistakes — a missing `result.json`, an undeclared
 output file, a parameter you assumed would be present.
 
-**If you supply your own container image**, run it the way the platform will:
+**If you supply your own container image**, use the conformance script in
+[`conformance/`](conformance/). It runs your image under the same restrictions as the
+platform (user id, read-only filesystem, no network, resource limits) and then checks your
+output against the contract:
+
+```bash
+./conformance/conform.sh your-image:tag --in /path/to/your/sample-in --uid 3001
+```
+
+Try a couple of `--uid` values to make sure nothing depends on the number, and add
+`--scratch MB` if you use `/scratch`. It needs `docker` and `jq`. Run `./conformance/conform.sh`
+with no arguments for the full option list.
+
+For a quick look without the script, this is the bare minimum:
 
 ```bash
 mkdir -p /tmp/t/in /tmp/t/out

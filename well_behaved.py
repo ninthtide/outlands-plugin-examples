@@ -20,11 +20,16 @@ time requirement in your source code, e.g. requirements.txt), and any data you n
 is staged into /in for you before your plugin starts.
 
 Your plugin interacts through the following directories:
-  /in     read-only. Your parameters and any datasets you subscribed to.
-  /out    writable. Everything you produce goes here.
-  /tmp    writable, small, and thrown away.
+  /in       read-only. Your parameters and any datasets you subscribed to.
+  /out      writable. Everything you produce goes here.
+  /scratch  optional, writable, private; for working files, thrown away.
+  /tmp      writable, small, and thrown away.
 
 Everything your plugin prints goes into the job log, which you may review and download later.
+Output is streamed while the job runs, so the log can be viewed live. Python plugins are
+automatically flushed to support live logging (the platform sets PYTHONUNBUFFERED=1);
+in other languages, the plugin author must flush their stdout output or live logging will
+not be visible until the plugin exits, or the buffer eventually fills.
 """
 
 import csv
