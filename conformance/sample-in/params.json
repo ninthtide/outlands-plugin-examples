@@ -1,6 +1,7 @@
 {
-  "_comment": "Sample /in/params.json. On the platform this file holds your plugin's parameters, validated against your controls manifest before staging. Replace with values your plugin expects when self-testing.",
-  "example_number": 42,
-  "example_flag": true,
-  "example_choice": "historical"
+  "_comment": "Sample /in/params.json for the worked example. On the platform this file holds your plugin's parameters, validated against your controls manifest before staging.",
+  "ensemble_members": 10,
+  "lead_days": 7,
+  "forecast_issue_date": "2026111100",
+  "demo": "none"
 }

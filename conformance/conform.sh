@@ -1,64 +1,64 @@
 #!/bin/bash
 #
-# OUTLANDS conformance harness - contributor self-test.
+# OUTLANDS conformance harness - contributor dev loop and self-test.
 #
-# Runs your plugin image locally under the exact restrictions the SmartRainGrid
-# research runtime applies in production, then checks that your output honours
-# the container contract. If this script passes on your machine, "works on my
-# machine" means "works on our platform".
+# Runs your plugin image locally under the same execution rules the
+# SmartRainGrid research runtime applies in production, reads your limits
+# from your plugin definition, and keeps the outputs so you can inspect them.
 #
 # Usage:
 #   ./conform.sh IMAGE [options]
 #
 # Options:
-#   --in DIR          directory staged read-only at /in (default: sample-in/
-#                     next to this script)
-#   --uid N[:M]       numeric uid[:gid] to run as (default 3001:3001). On the
-#                     platform you run as a UID in 3000-3999, GID equal to UID,
-#                     NO passwd entry and no other groups - so assume no
-#                     username and no home directory. Try a few values.
-#   --time S          wall-clock budget in seconds (default 600)
-#   --mem MB          memory budget in MB (default 2048)
-#   --out-cap MB      output budget in MB (default 100; the platform enforces
-#                     this as a hard filesystem cap - writes past it fail with
-#                     ENOSPC. This harness checks the total afterwards instead,
-#                     so it needs no root)
-#   --artefacts LIST  comma-separated expected output files/globs, e.g.
-#                     'advice.csv,charts/*.png' - must match what you declare
-#                     at onboarding
-#   --scratch MB      also mount a writable /scratch of this size (only if
-#                     your plugin is onboarded with a scratch budget)
+#   --definition FILE  your plugin definition (default: plugin.json in the
+#                      current directory). Only "budgets" and "artifacts" are
+#                      read; the rest is ours to set at onboarding.
+#   --in DIR           directory staged read-only at /in (default: sample-in/
+#                      next to this script)
+#   --workdir DIR      where each run's out/ and scratch/ are kept
+#                      (default: ./tmp/conform/runs)
+#   --uid N[:M]        numeric uid[:gid] to run as (default 3001:3001). On the
+#                      platform: a UID in 3000-3999, GID equal to UID, no
+#                      passwd entry, no other groups.
+#   --strict           the pre-handover check. Needs sudo and Linux. /out and
+#                      /scratch become disk-backed ext4 volumes, built exactly
+#                      as the platform builds them, and any output the
+#                      platform would reject is a FAIL rather than a warning.
+#   --clean            delete this run's kept outputs afterwards
 #
-# What the platform provides your container, and nothing else:
-#   /in      read-only: your staged data, /in/fetched/ externals,
-#            /in/params.json. Owned by your UID.
-#   /out     writable, size-capped, starts empty: result.json + your
-#            declared artefacts. Owned by your UID. Collected after the run.
-#   /scratch optional, writable, size-capped, starts empty, private to your
-#            UID. For intermediate files. Deleted after the run, never
-#            collected.
-#   /tmp     writable, small (256 MB by default), RAM-backed: what you
-#            write there counts against your memory budget.
-# /out, /scratch and /tmp are mounted noexec,nosuid. No network. No
-# capabilities. Read-only root filesystem. HOME=/tmp.
+# Two modes, one set of execution rules:
 #
-# Differences from the platform, because this harness needs no root:
-#   - /out and /scratch are world-writable host directories here, owned by
-#     you, not by the container UID; the platform makes them owned by it
-#   - the size caps are checked afterwards, not enforced as ENOSPC
-#   - host directories here are not noexec
-# A plugin that only reads /in and writes /out, /scratch and /tmp sees no
-# difference.
+#   default   no sudo. /out and /scratch are RAM-backed (tmpfs) Docker
+#             volumes: noexec, nosuid, nodev, owned by your UID, hard
+#             size-capped (ENOSPC), exactly like the platform. Because they
+#             live in RAM, the container's memory limit here is raised by
+#             their size, so your code gets at least the memory it gets on
+#             the platform. Output the platform would reject is a loud
+#             WARNING, and kept for you to look at.
+#   --strict  sudo. Disk-backed ext4 loop volumes, memory limit exactly your
+#             budget, output violations FAIL. If this passes, the platform
+#             sees no difference.
 #
-# The flag set below mirrors run_container() in the platform's executor
-# (outlands/runner/shenzi.sh); if you change one, change both.
+# Identical in both modes, and identical to the platform: your UID/GID,
+# read-only root filesystem, read-only /in, noexec+nosuid on every writable
+# mount, no network, no capabilities, no-new-privileges, CPU, process and
+# open-file limits, the wall-clock budget, HOME=/tmp.
+#
+# Requires docker and jq. The default mode also pulls a small helper image
+# (busybox) once, which holds the output volumes open and copies them out.
+#
+# The docker run flags below mirror run_container() in the platform's
+# executor (outlands/runner/shenzi.sh); if you change one, change both.
 #
 # Reference: the container contract in the README at
 # https://github.com/ninthtide/outlands-plugin-examples
 
 set -euo pipefail
 
-ALLOWED_EXTENSIONS="json csv txt png svg"
+ALLOWED_EXTENSIONS="json csv txt png svg nc"
+CONTRACT_FILES="result.json progress.json errors.json"
+BUDGET_KEYS="cpus memory_mb time_s output_mb pids nofile tmp_mb"
+HELPER_IMAGE=busybox:1.37.0
 
 usage() { sed -n '2,/^set -euo/{/^#/p}' "$0" | sed 's/^# \{0,1\}//'; exit 64; }
 
@@ -66,38 +66,34 @@ IMAGE="${1:-}"
 [[ -n $IMAGE && $IMAGE != -* ]] || usage
 shift
 
-IN_DIR="$(cd "$(dirname "$0")" && pwd)/sample-in"
-RUN_UID=3001 RUN_GID=3001 TIME_S=600 MEM_MB=2048 OUT_CAP_MB=100 ARTEFACTS=""
-SCRATCH_MB=0
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DEFINITION=plugin.json IN_DIR="$HERE/sample-in" WORKDIR=./tmp/conform/runs
+CEILINGS="$HERE/platform-ceilings.json"
+RUN_UID=3001 RUN_GID=3001 STRICT=0 CLEAN=0
 
 while (( $# )); do
     case "$1" in
-        --in)        IN_DIR=$2; shift 2 ;;
-        --uid)       RUN_UID=${2%%:*}; RUN_GID=${2#*:}; [[ $2 == *:* ]] || RUN_GID=$RUN_UID; shift 2 ;;
-        --time)      TIME_S=$2; shift 2 ;;
-        --mem)       MEM_MB=$2; shift 2 ;;
-        --out-cap)   OUT_CAP_MB=$2; shift 2 ;;
-        --artefacts) ARTEFACTS=$2; shift 2 ;;
-        --scratch)   SCRATCH_MB=$2; shift 2 ;;
+        --definition) DEFINITION=$2; shift 2 ;;
+        --in)         IN_DIR=$2; shift 2 ;;
+        --workdir)    WORKDIR=$2; shift 2 ;;
+        --uid)        RUN_UID=${2%%:*}; RUN_GID=${2#*:}; [[ $2 == *:* ]] || RUN_GID=$RUN_UID; shift 2 ;;
+        --strict)     STRICT=1; shift ;;
+        --clean)      CLEAN=1; shift ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
 done
 
-[[ -d $IN_DIR ]] || { echo "input directory not found: $IN_DIR" >&2; exit 65; }
+die() { echo "conform: $*" >&2; exit 65; }
 
-OUT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/conform-out.XXXXXX")
-SCRATCH_DIR="" SCRATCH_MOUNT=()
-if (( SCRATCH_MB > 0 )); then
-    SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/conform-scratch.XXXXXX")
-    chmod 777 "$SCRATCH_DIR"
-    SCRATCH_MOUNT=(-v "$SCRATCH_DIR:/scratch")
-fi
-# Files the container UID creates may not be removable by you; report, don't die
-trap 'rm -rf "$OUT_DIR" ${SCRATCH_DIR:+"$SCRATCH_DIR"} 2>/dev/null || echo "note: could not remove $OUT_DIR ${SCRATCH_DIR}" >&2' EXIT
-chmod 777 "$OUT_DIR"   # the arbitrary UID must be able to write here
+command -v docker >/dev/null || die "docker not found"
+command -v jq >/dev/null     || die "jq not found - install jq"
+[[ -d $IN_DIR ]]     || die "input directory not found: $IN_DIR"
+[[ -f $DEFINITION ]] || die "plugin definition not found: $DEFINITION (see plugin.json in the examples repo)"
+[[ -f $CEILINGS ]]   || die "platform-ceilings.json not found next to this script"
+jq -e 'type == "object"' "$DEFINITION" >/dev/null 2>&1 || die "$DEFINITION is not a JSON object"
 
-PASS=0 FAIL=0
-report() {  # report NAME OK [DETAIL]
+PASS=0 FAIL=0 WARN=0
+report() {  # report NAME yes|no [DETAIL]
     local name=$1 ok=$2 detail=${3:-}
     if [[ $ok == yes ]]; then
         echo "PASS  $name${detail:+  ($detail)}"; (( ++PASS ))
@@ -105,28 +101,176 @@ report() {  # report NAME OK [DETAIL]
         echo "FAIL  $name${detail:+  ($detail)}"; (( ++FAIL ))
     fi
 }
+# Output the platform would reject: FAIL under --strict, a loud WARNING otherwise
+judge_output() {  # judge_output NAME yes|no [DETAIL]
+    local name=$1 ok=$2 detail=${3:-}
+    if [[ $ok == yes ]] || (( STRICT )); then
+        report "$@"; return
+    fi
+    (( ++WARN ))
+    echo "WARN  $name"
+    echo "      !!! The platform would record this run INVALID_OUTPUT: $detail"
+    echo "      !!! Kept here for you to inspect. Declare it or stop writing it before handover."
+}
 
-echo "== Running $IMAGE under platform restrictions =="
+# --- the definition ---------------------------------------------------------
+
+echo "== Definition: $DEFINITION =="
+ignored=$(jq -r 'keys - ["budgets","artifacts"] | join(", ")' "$DEFINITION")
+[[ -n $ignored ]] && echo "note: not read here, set by the platform at onboarding: $ignored"
+
+budget() { jq -r --arg k "$1" '.budgets[$k] // empty' "$DEFINITION"; }
+ceiling() { jq -r --arg k "$1" '.[$k]' "$CEILINGS"; }
+
+refused=""
+for key in $BUDGET_KEYS scratch_mb; do
+    val=$(budget "$key")
+    if [[ -z $val ]]; then
+        [[ $key == scratch_mb ]] || refused+="budgets.$key missing; "
+        continue
+    fi
+    if [[ $key == cpus ]]; then
+        [[ $val =~ ^[0-9]+(\.[0-9]+)?$ ]] || { refused+="budgets.cpus not a number; "; continue; }
+        awk -v v="$val" -v c="$(ceiling cpus)" 'BEGIN { exit !(v > 0 && v <= c) }' \
+            || refused+="budgets.cpus=$val outside 0-$(ceiling cpus); "
+    else
+        [[ $val =~ ^[0-9]+$ ]] || { refused+="budgets.$key not a whole number; "; continue; }
+        (( val > 0 && val <= $(ceiling "$key") )) \
+            || refused+="budgets.$key=$val outside 1-$(ceiling "$key"); "
+    fi
+done
+mapfile -t ARTIFACTS < <(jq -r '.artifacts // [] | .[]' "$DEFINITION")
+for p in "${ARTIFACTS[@]}"; do
+    ext="${p##*.}"
+    [[ " $ALLOWED_EXTENSIONS " == *" ${ext,,} "* ]] || refused+="artifact '$p' must end in one of: $ALLOWED_EXTENSIONS; "
+done
+report "definition acceptable to the platform" "$( [[ -z $refused ]] && echo yes || echo no )" "$refused"
+[[ -z $refused ]] || { echo; echo "Fix the definition first; the platform would refuse it at onboarding."; exit 1; }
+
+CPUS=$(budget cpus) MEM_MB=$(budget memory_mb) TIME_S=$(budget time_s)
+OUT_MB=$(budget output_mb) PIDS=$(budget pids) NOFILE=$(budget nofile)
+TMP_MB=$(budget tmp_mb) SCRATCH_MB=$(budget scratch_mb); SCRATCH_MB=${SCRATCH_MB:-0}
+
+if (( STRICT )); then
+    RUN_MEM_MB=$MEM_MB disk="hard, ENOSPC (ext4, as on the platform)"
+else
+    RUN_MEM_MB=$(( MEM_MB + OUT_MB + SCRATCH_MB )) disk="hard, ENOSPC (tmpfs, RAM-backed)"
+fi
+
+echo
+echo "== Limits (platform enforcement in brackets) =="
+printf '  %-11s %-10s %s\n' \
+    cpus      "$CPUS"           "same  [hard: CPU quota]" \
+    memory_mb "$MEM_MB"         "$( (( STRICT )) && echo same || echo "raised to $RUN_MEM_MB here to cover RAM-backed /out and /scratch") [hard: OOM kill]" \
+    time_s    "$TIME_S"         "same  [hard: killed, TIMEOUT]" \
+    output_mb "$OUT_MB"         "$disk  [hard: ENOSPC]" \
+    scratch_mb "$SCRATCH_MB"    "$( (( SCRATCH_MB )) && echo "$disk" || echo "no /scratch")  [hard: ENOSPC]" \
+    tmp_mb    "$TMP_MB"         "same  [hard: ENOSPC, counts against memory]" \
+    pids      "$PIDS"           "same  [hard]" \
+    nofile    "$NOFILE"         "same  [hard]"
+
+# --- volumes ----------------------------------------------------------------
+
+mkdir -p "$WORKDIR"
+RUN_DIR=$(mktemp -d "$WORKDIR/run-$(date +%Y%m%d-%H%M%S)-XXXX")
+mkdir -p "$RUN_DIR/out"
+(( SCRATCH_MB )) && mkdir -p "$RUN_DIR/scratch"
+RUN_DIR=$(cd "$RUN_DIR" && pwd)
+NAME="conform-$$"
+MOUNTS=()
+
+cleanup() {
+    if (( STRICT )); then
+        for v in out scratch; do
+            mountpoint -q "$RUN_DIR/.mnt-$v" 2>/dev/null && sudo umount "$RUN_DIR/.mnt-$v"
+            rm -rf "$RUN_DIR/.mnt-$v" "$RUN_DIR/$v.img"
+        done
+    else
+        docker rm -f "$NAME-hold" >/dev/null 2>&1 || true
+        docker volume rm "$NAME-out" "$NAME-scratch" >/dev/null 2>&1 || true
+    fi
+    (( CLEAN )) && rm -rf "$RUN_DIR"
+    return 0
+}
+trap cleanup EXIT
+
+if (( STRICT )); then
+    [[ $(uname -s) == Linux ]] || die "--strict needs Linux (loop mounts on the docker host)"
+    echo
+    echo "== --strict: sudo is needed to loop-mount the output volumes =="
+    sudo -v || die "sudo refused"
+    # make_volume in the platform's shenzi-volume.sh, step for step
+    strict_volume() {  # strict_volume NAME MB MODE
+        local img="$RUN_DIR/$1.img" mnt="$RUN_DIR/.mnt-$1"
+        truncate -s "${2}M" "$img"
+        sudo mkfs.ext4 -q -m 0 -O ^has_journal "$img"
+        mkdir -p "$mnt"
+        sudo mount -o loop,noexec,nosuid,nodev "$img" "$mnt"
+        sudo rm -rf "$mnt/lost+found"
+        sudo chown "$RUN_UID:$RUN_GID" "$mnt"
+        sudo chmod "$3" "$mnt"
+        MOUNTS+=(-v "$mnt:/$1")
+    }
+    strict_volume out "$OUT_MB" 2750
+    (( SCRATCH_MB )) && strict_volume scratch "$SCRATCH_MB" 0700
+else
+    tmpfs_volume() {  # tmpfs_volume NAME MB MODE
+        docker volume create --driver local --opt type=tmpfs --opt device=tmpfs \
+            --opt "o=size=${2}m,uid=$RUN_UID,gid=$RUN_GID,mode=$3,noexec,nosuid,nodev" \
+            "$NAME-$1" >/dev/null
+        MOUNTS+=(-v "$NAME-$1:/$1")
+    }
+    tmpfs_volume out "$OUT_MB" 2750
+    (( SCRATCH_MB )) && tmpfs_volume scratch "$SCRATCH_MB" 0700
+    # A tmpfs volume is unmounted, and its contents lost, when the last
+    # container using it stops. The holder keeps it mounted until we copy out.
+    docker run -d --name "$NAME-hold" --user "${RUN_UID}:${RUN_GID}" \
+        --cap-drop ALL --security-opt no-new-privileges --read-only \
+        --network none "${MOUNTS[@]}" "$HELPER_IMAGE" sleep 86400 >/dev/null \
+        || die "could not start the helper container ($HELPER_IMAGE)"
+fi
+
+# --- run --------------------------------------------------------------------
+
+echo
+echo "== Running $IMAGE as ${RUN_UID}:${RUN_GID} =="
 rc=0
 timeout --kill-after=30 "$TIME_S" \
-    docker run --rm --name "conform-$$" \
+    docker run --rm --name "$NAME" \
         --user "${RUN_UID}:${RUN_GID}" \
         --cap-drop ALL \
         --security-opt no-new-privileges \
-        --memory "${MEM_MB}m" --memory-swap "${MEM_MB}m" \
-        --cpus 2 \
-        --pids-limit 128 \
-        --ulimit nofile=256 \
+        --memory "${RUN_MEM_MB}m" --memory-swap "${RUN_MEM_MB}m" \
+        --cpus "$CPUS" \
+        --pids-limit "$PIDS" \
+        --ulimit "nofile=$NOFILE" \
         --read-only \
-        --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+        --tmpfs "/tmp:rw,noexec,nosuid,size=${TMP_MB}m" \
         --network none \
         --init \
         --env HOME=/tmp \
         --env PYTHONUNBUFFERED=1 \
         -v "$(cd "$IN_DIR" && pwd):/in:ro" \
-        -v "$OUT_DIR:/out" \
-        "${SCRATCH_MOUNT[@]}" \
+        "${MOUNTS[@]}" \
         "$IMAGE" || rc=$?
+if (( rc == 124 || rc == 137 )); then
+    docker kill "$NAME" >/dev/null 2>&1 || true
+fi
+
+# --- collect ----------------------------------------------------------------
+
+collect() {  # collect NAME - a file your UID cannot read is skipped, not fatal
+    if (( STRICT )); then
+        sudo tar -C "$RUN_DIR/.mnt-$1" -cf - . | tar -C "$RUN_DIR/$1" -xf -
+    else
+        docker exec "$NAME-hold" tar -C "/$1" -cf - . | tar -C "$RUN_DIR/$1" -xf -
+    fi || echo "note: some of /$1 could not be copied out (unreadable by ${RUN_UID}?)" >&2
+}
+collect out
+(( SCRATCH_MB )) && collect scratch
+OUT_DIR="$RUN_DIR/out"
+
+# --- checks -----------------------------------------------------------------
 
 echo
 echo "== Contract checks =="
@@ -135,75 +279,97 @@ if (( rc == 124 )); then
 else
     report "finishes inside the time budget" yes
 fi
-report "exit code 0" "$( (( rc == 0 )) && echo yes || echo no )" "exit=$rc"
+case $rc in
+    0)   report "exit code 0" yes ;;
+    137) report "exit code 0" no "exit=137: killed, usually out of memory (budget ${MEM_MB} MB)" ;;
+    126) report "exit code 0" no "exit=126: could not execute - writable mounts are noexec" ;;
+    127) report "exit code 0" no "exit=127: command not found - check ENTRYPOINT/CMD exist in the image" ;;
+    *)   report "exit code 0" no "exit=$rc" ;;
+esac
 
 RESULT="$OUT_DIR/result.json"
 if [[ -f $RESULT && ! -L $RESULT ]]; then
     report "result.json present" yes
-    if command -v jq >/dev/null; then
-        status=$(jq -er '.status' "$RESULT" 2>/dev/null || echo INVALID)
-        case "$status" in
-            success|failure) report "result.json parses, status=$status" yes ;;
-            INVALID)         report "result.json is valid JSON with .status" no ;;
-            *)               report "result.json status is success|failure" no "got: $status" ;;
-        esac
-        summary_len=$(jq -r '.summary // "" | length' "$RESULT" 2>/dev/null || echo 0)
-        report "result.json has a summary" "$( (( summary_len > 0 )) && echo yes || echo no )" \
-            "$(jq -r '.summary // "" | .[0:160]' "$RESULT" 2>/dev/null)"
+    status=$(jq -er '.status' "$RESULT" 2>/dev/null || echo INVALID)
+    case "$status" in
+        success|failure) report "result.json parses, status=$status" yes ;;
+        INVALID)         report "result.json is valid JSON with .status" no ;;
+        *)               report "result.json status is success|failure" no "got: $status" ;;
+    esac
+    # Optional on the platform, but it is the first thing anyone reads
+    summary=$(jq -r '.summary // "" | .[0:160]' "$RESULT" 2>/dev/null || true)
+    if [[ -n $summary ]]; then
+        echo "      summary: $summary"
     else
-        report "result.json validated" no "jq not installed - install jq to validate"
+        echo "note  result.json has no summary: allowed, but it is what people see first"
     fi
 else
     report "result.json present" no "the control-plane handshake is mandatory"
 fi
 
-# Symlinks in /out are rejected at collection (and never followed)
-symlinks=$(find "$OUT_DIR" -type l | head -5)
-report "no symlinks in /out" "$( [[ -z $symlinks ]] && echo yes || echo no )" "$symlinks"
+# Never tolerated, in either mode: these are refused on the platform outright
+odd=$(find "$OUT_DIR" ! -type f ! -type d | head -5 | sed "s|$OUT_DIR/||")
+report "only regular files in /out (no symlinks, pipes, devices)" \
+    "$( [[ -z $odd ]] && echo yes || echo no )" "$odd"
 
-# Every artefact must use an allowlisted extension; undeclared arrivals are an
-# INVALID_OUTPUT on the platform and suspend the plugin
-bad_ext=""
+is_contract() { [[ " $CONTRACT_FILES " == *" $1 "* ]]; }
+has_signature() {  # binary formats must open with their signature
+    local head
+    head=$(head -c 8 "$1" | od -An -tx1 | tr -d ' \n')
+    case "$head" in
+        43444601*|43444602*|43444605*|894844460d0a1a0a) return 0 ;;
+    esac
+    return 1
+}
+
+bad_ext="" bad_sig="" undeclared=""
 while IFS= read -r f; do
-    ext="${f##*.}"
-    [[ " $ALLOWED_EXTENSIONS " == *" ${ext,,} "* ]] || bad_ext+="${f#"$OUT_DIR"/} "
-done < <(find "$OUT_DIR" -type f ! -path "$RESULT")
-report "artefact extensions allowlisted ($ALLOWED_EXTENSIONS)" \
-    "$( [[ -z $bad_ext ]] && echo yes || echo no )" "$bad_ext"
-
-if [[ -n $ARTEFACTS ]]; then
-    missing="" undeclared=""
-    IFS=',' read -r -a patterns <<< "$ARTEFACTS"
-    for p in "${patterns[@]}"; do
-        compgen -G "$OUT_DIR/$p" >/dev/null || missing+="$p "
+    rel="${f#"$OUT_DIR"/}"
+    is_contract "$rel" && continue
+    ext="${rel##*.}"; ext=${ext,,}
+    if [[ " $ALLOWED_EXTENSIONS " != *" $ext "* ]]; then bad_ext+="$rel "; continue; fi
+    if [[ $ext == nc ]] && ! has_signature "$f"; then bad_sig+="$rel "; continue; fi
+    matched=no
+    for p in "${ARTIFACTS[@]}"; do
+        # shellcheck disable=SC2053
+        [[ $rel == $p ]] && matched=yes && break
     done
-    while IFS= read -r f; do
-        rel="${f#"$OUT_DIR"/}"
-        matched=no
-        for p in "${patterns[@]}"; do
-            # shellcheck disable=SC2053
-            [[ $rel == $p ]] && matched=yes && break
-        done
-        [[ $matched == yes ]] || undeclared+="$rel "
-    done < <(find "$OUT_DIR" -type f ! -path "$RESULT")
-    report "declared artefacts all produced" "$( [[ -z $missing ]] && echo yes || echo no )" "$missing"
-    report "no undeclared artefacts" "$( [[ -z $undeclared ]] && echo yes || echo no )" "$undeclared"
-fi
+    [[ $matched == yes ]] || undeclared+="$rel "
+done < <(find "$OUT_DIR" -type f | sort)
 
-total_bytes=$(du -sb "$OUT_DIR" | cut -f1)
-cap_bytes=$(( OUT_CAP_MB * 1024 * 1024 ))
-report "output within ${OUT_CAP_MB}MB budget" \
-    "$( (( total_bytes <= cap_bytes )) && echo yes || echo no )" "${total_bytes} bytes"
+# A file posing as a format it is not is suspicious, not cruft
+report ".nc artefacts are real NetCDF" "$( [[ -z $bad_sig ]] && echo yes || echo no )" "$bad_sig"
+judge_output "artefact extensions allowlisted ($ALLOWED_EXTENSIONS)" \
+    "$( [[ -z $bad_ext ]] && echo yes || echo no )" "${bad_ext:+extension not allowed: $bad_ext}"
+judge_output "no undeclared artefacts" \
+    "$( [[ -z $undeclared ]] && echo yes || echo no )" "${undeclared:+not in your artifacts list: $undeclared}"
 
-if [[ -n $SCRATCH_DIR ]]; then
-    scratch_bytes=$(du -sb "$SCRATCH_DIR" | cut -f1)
-    report "scratch within ${SCRATCH_MB}MB budget" \
-        "$( (( scratch_bytes <= SCRATCH_MB * 1024 * 1024 )) && echo yes || echo no )" \
-        "${scratch_bytes} bytes (discarded, as on the platform)"
-fi
+missing=""
+for p in "${ARTIFACTS[@]}"; do
+    compgen -G "$OUT_DIR/$p" >/dev/null || missing+="$p "
+done
+# Not a platform rule: a run may legitimately skip a declared output
+[[ -z $missing ]] || echo "note  declared but not produced this run: $missing"
+
+# Summed file sizes, as the platform's collection measures them
+total_bytes=$(find "$OUT_DIR" -type f -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')
+report "output within ${OUT_MB} MB budget" \
+    "$( (( total_bytes <= OUT_MB * 1024 * 1024 )) && echo yes || echo no )" "${total_bytes} bytes"
 
 echo
-echo "== $PASS passed, $FAIL failed =="
+echo "== $PASS passed, $FAIL failed, $WARN warnings =="
+if (( CLEAN )); then
+    echo "Outputs deleted (--clean)."
+else
+    echo "Outputs kept: $OUT_DIR"
+    (( SCRATCH_MB )) && echo "Scratch kept: $RUN_DIR/scratch  (production deletes any /scratch content)"
+fi
 (( FAIL == 0 )) || exit 1
-echo "Your plugin conforms. On the platform it runs under these same flags,"
-echo "with the size caps enforced by the filesystem and no network."
+if (( WARN )); then
+    echo "Runs under the platform's execution rules, but the warnings above"
+    echo "would fail it there. Run with --strict before handing over."
+elif (( STRICT )); then
+    echo "Your plugin conforms. The platform runs it under these same rules."
+else
+    echo "Clean. Run with --strict for the disk-backed pre-handover check."
+fi

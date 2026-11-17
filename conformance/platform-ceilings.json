@@ -1,0 +1,11 @@
+{
+  "_comment": "Platform ceilings over per-plugin budgets. Your plugin definition's budgets must not exceed these. Mirrors the runner (shenzi.conf MAX_*) and the dispatcher; a test keeps all three equal.",
+  "cpus": 4,
+  "memory_mb": 12288,
+  "time_s": 21600,
+  "output_mb": 1024,
+  "pids": 512,
+  "nofile": 1024,
+  "tmp_mb": 1024,
+  "scratch_mb": 20480
+}

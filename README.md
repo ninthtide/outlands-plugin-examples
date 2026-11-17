@@ -31,22 +31,21 @@ database), but has no network access of its own.
 Nothing else is writable: the rest of the filesystem is read-only. `HOME` is set to `/tmp`.
 `/out`, `/scratch` and `/tmp` won't execute anything.
 
-`/scratch` is opt-in: ask for it, with a size, when your plugin is onboarded. Anything left
-in `/out` at the end that isn't a declared output fails the job, so `/scratch` is the place
-for working files you don't want back.
+`/scratch` is opt-in: please advise at onboarding if you require it and what size. Any output left
+in `/out` at the end that isn't a declared output results in job failure.  Use /scratch for any temporary files during your job execution (if you requested this feature at onboarding; otherwise use /tmp, but this consumes your memory budget).
 
 ### Who your code runs as
 
 - A numeric user id in the range 3000-3999, with the group id the same number. There is no
   username, no `/etc/passwd` entry and no other groups. Any `USER` in your image is
   overridden.
-- `/in`, `/out` and `/scratch` are handed to that user before your container starts, so
-  you can always read `/in` and write the others, whatever the number is.
+- `/in`, `/out` and `/scratch` are handed to (chowned) that user before your container starts, so
+  you can always read `/in` and write to the others, whatever the number is.
 - Your own files inside the image must be world-readable (and world-executable for
-  programs and directories), e.g. `RUN chmod -R a+rX /app`. Group permissions don't help,
+  programs and directories), e.g. `RUN chmod -R a+rX /app`. Group permissions will not assist with file access,
   because you won't be in your image's group. Make your `WORKDIR` world-readable too, or
   anything using relative paths will fail.
-- If you'd rather build against one fixed number, ask at onboarding and we'll pin it.
+- If you'd rather build against one fixed UID number, ask at onboarding and an id will be assigned and pinned for your use.
 
 **There is no network.** Your container cannot reach the internet, the main
 database, or anything else. You cannot fetch a file, call an API, or install a
@@ -57,7 +56,7 @@ behalf by the platform, into `/in`, before your plugin starts.
 
 This is the single most important thing to design around, and is a hard requirement
 to permit the execution of contributor code at all. If your analysis needs a dataset,
-you declare that when your plugin is onboarded and the data feed is refreshed prior
+you declare that when your plugin is onboarded and the data feed is refreshed on your behalf by the Outlands platform prior
 to executing your job, every time.
 
 You also run within a fixed budget: CPU, memory, wall-clock time, output size,
@@ -67,17 +66,17 @@ exceeded.
 
 ---
 
-## The four files
+## Plugin communication via files
 
-Everything your plugin communicates, it does so by writing a file.
+Communication with plugins is performed by reading and writing files.
 
 **Note the plurals in filenames: they indicate whether a file accepts multiple entries.**
 
 ### `/in/params.json` — read
 
-Your parameters. Always present, validated prior to your plugin running.
+Your parameters. Always present, validated by the Outlands platform prior to your plugin running.
 
-The platform validates params.json against the parameter list you declared before
+The params.json file is validated against the parameter list you declared before
 your container starts, so a missing or malformed value should never reach your code.
 
 ```python
@@ -90,7 +89,7 @@ with open("/in/params.json") as f:
 **Required.** A job that completes (even successfully) without writing a `result.json`
 is considered a failure.
 
-Two fields matter to the platform:
+Two fields are significant to the platform:
 
 ```json
 {
@@ -99,7 +98,7 @@ Two fields matter to the platform:
 }
 ```
 
-- `status` — `"success"` or `"failure"`. Your self-declared verdict on your own run.
+- `status` — `"success"` or `"failure"`. Your self-declared verdict on how your run performed.
 - `summary` — a one line summary (max length: 500 chars)
 
 Status is case-sensitive and must match exactly "success" or "failure".
@@ -107,12 +106,12 @@ Status is case-sensitive and must match exactly "success" or "failure".
 If summary exceeds 500 chars, the text will be trimmed.  Any malicious or
 unusual characters are removed.  Accented characters and diacritics are retained.
 
-Everything else written into `result.json` is considered output that belongs to the
+Everything else (i.e. other JSON keys) written into `result.json` is considered output that belongs to the
 plugin, and is stored by the platform, subject to retention rules agreed when the
 plugin was onboarded.  Results may be downloaded later from the Research Centre.
 
-`result.json` must be under 64KB in total.  It is a summary of your run, not a
-place to store the run's output — write bulk data to a declared artefact instead.
+`result.json` must be under 64KB in total.  It is intended to represent a summary of your run, not a
+place to store the run's output.  Bulk data output should be written as a separate file or files, and needs to be a declared artefact instead.
 
 ### `/out/progress.json` — write, overwrite freely
 
@@ -179,7 +178,11 @@ Any other file in `/out` must match the artefact patterns you declared when your
 onboarded — for example `*.csv`. An undeclared file is unexpected and results in plugin job
 failure.
 
-Permitted types are `json`, `csv`, `txt`, `png`, `svg`.
+Permitted types are `json`, `csv`, `txt`, `png`, `svg`, `nc`. A `.nc` file must be real
+NetCDF (classic or NetCDF-4): a file that merely carries the extension is refused.
+
+Patterns may include directories, e.g. `forecast/*.nc` or `diagnostics/*.txt`, so a tree of
+diagnostic outputs can be declared once rather than file by file.
 
 All output is retained by the platform subject to agreed retention rules (date-based or
 last # of job runs), and may be downloaded from the Research Centre.
@@ -191,7 +194,7 @@ the retention rules, please discuss with the SmartRainGrid development team.
 
 Anything your program prints to the terminal standard output (stdout) is captured into the
 job log, for later download and review.  Output is streamed while your job runs, so the log
-can be viewed live, or maybe reviewed once the job has finished, as you wish.
+can be viewed live, or may be reviewed once the job has finished, as you wish.
 
 **If you are writing in Python this works automatically** — the platform runs your container
 with `PYTHONUNBUFFERED=1`.
@@ -203,7 +206,7 @@ a long time before being sent to SmartRainGrid and being visible in the Research
 
 ---
 
-## The examples
+## Example plugins
 
 ### `well_behaved.py`
 
@@ -237,50 +240,197 @@ One script that accepts a `mode` parameter, selecting one of twelve behaviours:
 
 ---
 
-## Testing locally
+## Developing and testing locally
 
-You may verify that your codebase will work once onboarded by simulating the same conditions
-within your own development environment.
+Some utilities are provided to assist you with developing your plugin and ensuring it complies with platform requirements, prior to onboarding.
 
-**If you are writing a source-code plugin** (the platform builds your image for you from your
-repository), you do not need to build anything to test. Create the two directories, point your
-script at them instead of `/in` and `/out`, and run it directly. That is the fastest feedback
-loop available to you and it catches most mistakes — a missing `result.json`, an undeclared
-output file, a parameter you assumed would be present.
+`conformance/conform.sh` runs your image on your own machine using the platform's execution
+rules, reads your limits from your plugin definition, and retains all plugin output so
+you can inspect it.
 
-**If you supply your own container image**, use the conformance script in
-[`conformance/`](conformance/). It runs your image under the same restrictions as the
-platform (user id, read-only filesystem, no network, resource limits) and then checks your
-output against the contract:
+### Application of platform controls and limits
+
+If you launch your plugin using `conform.sh`, the rules your code runs under are identical to the platform:
+
+- your numeric UID/GID, with no passwd entry
+- read-only root filesystem and read-only `/in`
+- `/out`, `/scratch` and `/tmp` are writable but **will not execute anything** (noexec, nosuid)
+- no network, no capabilities, no privilege escalation
+- CPU, process count, open files and wall-clock time are your budgets, enforced
+- `HOME=/tmp`
+
+Simulating some runtime limits requires root access. Running your plugin with `conform.sh` does not require root access (sudo).  It is possible to simulate runtime limits exactly with the `--strict` option, which requires sudo:
+
+| | Platform (production) | `conform.sh` | `conform.sh --strict` |
+|---|---|---|---|
+| `/out`, `/scratch` | disk-backed, hard size cap | RAM-backed, hard size cap | disk-backed, hard size cap |
+| memory limit | your `memory_mb` | `memory_mb` + `output_mb` + `scratch_mb` | your `memory_mb` |
+| undeclared files or unexpected types | run fails, plugin suspended | WARNING, output kept | FAIL |
+| symlinks, special files, fake file types | run fails, plugin suspended | FAIL | FAIL |
+| requirements | | `docker`, `jq` | `docker`, `jq`, `sudo`, Linux |
+
+The default mode is intentionally more generous than the production platform.  `--strict` attempts to as closely as possible simulate all production runtime limitations, but requires sudo access.
+
+### Your plugin definition
+
+`plugin.json` at the root of this repository is an example copy of a plugin definition.  It is both read and used by `conform.sh`, but additionally, helps define your preferred budgets when onboarding on to SmartRainGrid.  The following fields are read:
+
+- `budgets`: the limits applied to your plugin execution. They must not exceed the platform ceilings defined in
+  `conformance/platform-ceilings.json`, or the harness refuses before running, exactly as
+  onboarding would.
+- `artifacts`: the output patterns you expect to write. Anything else in `/out` is logged as a WARNING as it represents undeclared output.  In production, this would result in your plugin being flagged as failed and would be automatically suspended.
+
+Everything else in the file is set by us at onboarding. When you are happy with your copy,
+send it to us: we review it, may amend it, and load it. The platform's copy is the version used during production runs.
+
+### Worked example 1: a clean run
+
+`forecast_example/` is a small staged ensemble forecast: warm-up state in `/scratch`, a
+NetCDF ensemble and a CSV summary in `/out`, progress as it goes, `result.json` last.
 
 ```bash
-./conformance/conform.sh your-image:tag --in /path/to/your/sample-in --uid 3001
+docker build --platform linux/amd64 -t forecast-example forecast_example
+./conformance/conform.sh forecast-example --definition plugin.json
 ```
 
-Try a couple of `--uid` values to make sure nothing depends on the number, and add
-`--scratch MB` if you use `/scratch`. It needs `docker` and `jq`. Run `./conformance/conform.sh`
-with no arguments for the full option list.
+The harness prints the limits it applies and how the platform enforces each one, runs the
+image, checks the output, and tells you where it kept it:
 
-For a quick look without the script, this is the bare minimum:
+```
+== Definition: plugin.json ==
+note: not read here, set by the platform at onboarding: _comment, description, display_name, image_ref, name, plugin_class
+PASS  definition acceptable to the platform
+
+== Limits (platform enforcement in brackets) ==
+  cpus        2          same  [hard: CPU quota]
+  memory_mb   4096       raised to 8256 here to cover RAM-backed /out and /scratch [hard: OOM kill]
+  time_s      1800       same  [hard: killed, TIMEOUT]
+  output_mb   64         hard, ENOSPC (tmpfs, RAM-backed)  [hard: ENOSPC]
+  scratch_mb  4096       hard, ENOSPC (tmpfs, RAM-backed)  [hard: ENOSPC]
+  tmp_mb      256        same  [hard: ENOSPC, counts against memory]
+  pids        128        same  [hard]
+  nofile      256        same  [hard]
+
+== Running forecast-example as 3001:3001 ==
+[  5%] Warm-up state, 10 members, working in /scratch
+[ 20%] Running ensemble
+[ 40%] Lead day 1 of 7
+[ 47%] Lead day 2 of 7
+[ 54%] Lead day 3 of 7
+[ 61%] Lead day 4 of 7
+[ 68%] Lead day 5 of 7
+[ 75%] Lead day 6 of 7
+[ 82%] Lead day 7 of 7
+[ 92%] Writing NetCDF and CSV
+[100%] Done
+
+== Contract checks ==
+PASS  finishes inside the time budget
+PASS  exit code 0
+PASS  result.json present
+PASS  result.json parses, status=success
+      summary: 10-member 7-day forecast issued 2026111100; final-day median 24.8 ML/d
+PASS  only regular files in /out (no symlinks, pipes, devices)
+PASS  .nc artefacts are real NetCDF
+PASS  artefact extensions allowlisted (json csv txt png svg nc)
+PASS  no undeclared artefacts
+note  declared but not produced this run: diagnostics/*.png 
+PASS  output within 64 MB budget  (17450 bytes)
+
+== 10 passed, 0 failed, 0 warnings ==
+Outputs kept: tmp/conform/runs/run-20261117-174006-8RxC/out
+Scratch kept: tmp/conform/runs/run-20261117-174006-8RxC/scratch  (production deletes any /scratch content)
+Clean. Run with --strict for the disk-backed pre-handover check.
+```
+
+The first run also pulls `busybox`, the small helper that holds the RAM-backed volumes
+open and copies your output out of them.
+
+Review the produced output:
 
 ```bash
-mkdir -p /tmp/t/in /tmp/t/out
-echo '{"steps": 5, "delay_s": 0.2}' > /tmp/t/in/params.json
-
-docker run --rm \
-    --network none \
-    -v /tmp/t/in:/in:ro \
-    -v /tmp/t/out:/out \
-    your-image:tag
-
-ls -la /tmp/t/out
-cat /tmp/t/out/result.json
+ls -R tmp/conform/runs/run-*/out
+ncdump -h tmp/conform/runs/run-*/out/forecast/streamflow_ensemble.nc
 ```
 
-`--network none` is important to retain in your local command even though it is
-inconvenient. This reproduces the conditions your plugin will actually run under, and
-will surface any hidden network dependencies in your codebase prior to onboarding to the
-SmartRainGrid platform.
+`/scratch` is kept too, so you can check your intermediates. On the production platform, this output would be deleted after
+every run and never collected.
+
+### Worked example 2: breaking the rules intentionally
+
+Set `demo` in a copy of the sample parameters to see each failure condition:
+
+```bash
+cp -r conformance/sample-in /tmp/demo-in
+jq '.demo = "exec_tmp"' conformance/sample-in/params.json > /tmp/demo-in/params.json
+./conformance/conform.sh forecast-example --definition plugin.json --in /tmp/demo-in
+```
+
+| `demo` | What it does | What you see |
+|---|---|---|
+| `write_root` | writes into its own image directory | `OSError: [Errno 30] Read-only file system`, exit 1 |
+| `exec_tmp` | copies a program to `/tmp` and runs it | `PermissionError: [Errno 13]`, exit 1 |
+| `network` | fetches a web page | name resolution fails, exit 1 |
+| `undeclared` | writes `diagnostics/debug.log` | WARNING: `.log` is not an allowed type; `--strict` FAILs |
+| `oversized` | writes past `output_mb` | `OSError: [Errno 28] No space left on device`, exit 1 |
+
+Real output, trimmed. `exec_tmp`:
+
+```
+== Running forecast-example as 3001:3001 ==
+[  5%] Warm-up state, 10 members, working in /scratch
+ERROR: PermissionError: [Errno 13] Permission denied: '/tmp/helper'
+...
+FAIL  exit code 0  (exit=1)
+PASS  result.json parses, status=failure
+      summary: PermissionError: [Errno 13] Permission denied: '/tmp/helper'
+```
+
+The plugin still wrote a `result.json` with `"status": "failure"` and its reason, because
+`forecast.py` catches its own crash on the way out. Plugin authors should do the same: on the platform that
+reason is what you and we see first.
+
+`undeclared` runs to completion, and is kept, but tells you plainly what would go wrong:
+
+```
+WARN  artefact extensions allowlisted (json csv txt png svg nc)
+      !!! The platform would record this run INVALID_OUTPUT: extension not allowed: diagnostics/debug.log
+      !!! Kept here for you to inspect. Declare it or stop writing it before handover.
+```
+
+`oversized` hits the cap as a real `No space left on device`, mid-write, exactly as it
+would on the platform. Its `result.json` is left empty, because `/out` was already full when the plugin tried
+to report its failure: keep large intermediates in `/scratch`.
+
+### Worked example 3: pre-handover check
+
+```bash
+./conformance/conform.sh forecast-example --definition plugin.json --strict
+```
+
+`--strict` asks for sudo once, to loop-mount ext4 volumes for `/out` and `/scratch` the
+same way the platform does. On Debian/Ubuntu it needs `e2fsprogs` (for `mkfs.ext4`), which
+is almost always installed already. It does not work with Docker Desktop (on any OS) or a remote Docker daemon, because
+the volumes must be mounted on the same machine the Docker daemon runs on.
+
+### Options
+
+| Option | Default | |
+|---|---|---|
+| `--definition FILE` | `./plugin.json` | your plugin definition |
+| `--in DIR` | `conformance/sample-in` | staged read-only at `/in` |
+| `--workdir DIR` | `./tmp/conform/runs` | each run keeps its `out/` and `scratch/` here |
+| `--uid N[:M]` | `3001` | try a couple of values: nothing should depend on the number |
+| `--strict` | off | disk-backed volumes, exact memory, output violations FAIL |
+| `--clean` | off | delete the run's outputs afterwards |
+
+Files in your `--in` directory must be world-readable: the container runs as a UID that is
+not you.
+
+**If you are writing a source-code plugin** (the platform builds your image for you from
+your repository), you can skip the image entirely for quick iteration: point your script at
+local `in/` and `out/` directories and run it. Build the image and run the harness before
+you push.
 
 ---
 

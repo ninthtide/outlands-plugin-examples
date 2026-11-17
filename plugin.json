@@ -1,0 +1,24 @@
+{
+  "_comment": "A working copy of a plugin definition. conform.sh applies its budgets and checks its artifacts, simulating production conditions.",
+  "name": "monbulk-sf",
+  "display_name": "Monbulk streamflow forecast",
+  "description": "Ensemble streamflow forecast for Monbulk Creek.",
+  "plugin_class": "image",
+  "image_ref": "<add your Docker image URL here>",
+  "artifacts": [
+    "forecast/*.nc",
+    "forecast/*.csv",
+    "diagnostics/*.txt",
+    "diagnostics/*.png"
+  ],
+  "budgets": {
+    "cpus": 2,
+    "memory_mb": 4096,
+    "time_s": 1800,
+    "output_mb": 64,
+    "pids": 128,
+    "nofile": 256,
+    "tmp_mb": 256,
+    "scratch_mb": 4096
+  }
+}
