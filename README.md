@@ -293,6 +293,11 @@ docker build --platform linux/amd64 -t forecast-example forecast_example
 ./conformance/conform.sh forecast-example --definition plugin.json
 ```
 
+`conform.sh` only runs images already in your local Docker image store, and never pulls
+from a registry: what runs is always your latest `docker build`. Your loop is edit, build,
+run. `image_ref` in `plugin.json` is not used locally; it is where the platform pulls your
+published image from.
+
 The harness prints the limits it applies and how the platform enforces each one, runs the
 image, checks the output, and tells you where it kept it:
 

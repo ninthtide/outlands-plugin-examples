@@ -9,6 +9,10 @@
 # Usage:
 #   ./conform.sh IMAGE [options]
 #
+# IMAGE must already be in your local Docker image store: build it first
+# (docker build -t IMAGE .). The harness never pulls it from a registry, so
+# what runs is always your latest build, not a published copy.
+#
 # Options:
 #   --definition FILE  your plugin definition (default: plugin.json in the
 #                      current directory). Only "budgets" and "artifacts" are
@@ -87,6 +91,8 @@ die() { echo "conform: $*" >&2; exit 65; }
 
 command -v docker >/dev/null || die "docker not found"
 command -v jq >/dev/null     || die "jq not found - install jq"
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || die "image not found locally: $IMAGE - build it first (docker build -t $IMAGE .); conform.sh never pulls"
 [[ -d $IN_DIR ]]     || die "input directory not found: $IN_DIR"
 [[ -f $DEFINITION ]] || die "plugin definition not found: $DEFINITION (see plugin.json in the examples repo)"
 [[ -f $CEILINGS ]]   || die "platform-ceilings.json not found next to this script"
@@ -236,7 +242,7 @@ echo
 echo "== Running $IMAGE as ${RUN_UID}:${RUN_GID} =="
 rc=0
 timeout --kill-after=30 "$TIME_S" \
-    docker run --rm --name "$NAME" \
+    docker run --rm --pull never --name "$NAME" \
         --user "${RUN_UID}:${RUN_GID}" \
         --cap-drop ALL \
         --security-opt no-new-privileges \
