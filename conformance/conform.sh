@@ -29,6 +29,8 @@
 #                      as the platform builds them, and any output the
 #                      platform would reject is a FAIL rather than a warning.
 #   --clean            delete this run's kept outputs afterwards
+#   --diagnose         also print your Docker setup, the image's own /out and
+#                      how /out is mounted. Paste the whole output to us.
 #
 # Two modes, one set of execution rules:
 #
@@ -73,7 +75,7 @@ shift
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEFINITION=plugin.json IN_DIR="$HERE/sample-in" WORKDIR=./tmp/conform/runs
 CEILINGS="$HERE/platform-ceilings.json"
-RUN_UID=3001 RUN_GID=3001 STRICT=0 CLEAN=0
+RUN_UID=3001 RUN_GID=3001 STRICT=0 CLEAN=0 DIAGNOSE=0
 
 while (( $# )); do
     case "$1" in
@@ -83,6 +85,7 @@ while (( $# )); do
         --uid)        RUN_UID=${2%%:*}; RUN_GID=${2#*:}; [[ $2 == *:* ]] || RUN_GID=$RUN_UID; shift 2 ;;
         --strict)     STRICT=1; shift ;;
         --clean)      CLEAN=1; shift ;;
+        --diagnose)   DIAGNOSE=1; shift ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
 done
@@ -236,6 +239,40 @@ else
         || die "could not start the helper container ($HELPER_IMAGE)"
 fi
 
+# /out's root as the container sees it: uid:gid and mode
+out_owner() {
+    if (( STRICT )); then
+        sudo stat -c '%u:%g %a' "$RUN_DIR/.mnt-out"
+    else
+        docker exec "$NAME-hold" stat -c '%u:%g %a' /out
+    fi 2>/dev/null || echo unknown
+}
+OUT_EXPECTED="$RUN_UID:$RUN_GID 2750"
+
+if (( DIAGNOSE )); then
+    echo
+    echo "== Diagnostics =="
+    echo "conform.sh   sha256 $(sha256sum "$0" | cut -c1-12)$( (( STRICT )) && echo ', --strict')"
+    echo "host         $(uname -srm)"
+    docker version --format '{{json .}}' 2>/dev/null | jq -r '"engine       \(.Server.Platform.Name // "" | if . == "" then "Docker" else . end) \(.Server.Version) (\(.Server.Os)/\(.Server.Arch)), client \(.Client.Version)"' || echo "engine       unknown"
+    docker info --format 'daemon       {{.OperatingSystem}}; storage {{.Driver}}; cgroup {{.CgroupDriver}} v{{.CgroupVersion}}; security {{join .SecurityOptions ","}}' 2>&1 || true
+    echo "context      $(docker context show 2>&1 || true)"
+    # jq, not --format: the containerd image store omits unset .Config keys
+    docker image inspect "$IMAGE" | jq -r '.[0] | .Config as $c | "image        \(.Id); user=\($c.User // ""); workdir=\($c.WorkingDir // ""); entrypoint=\($c.Entrypoint | tojson); cmd=\($c.Cmd | tojson); volumes=\($c.Volumes | tojson)"' || true
+    img_out=""
+    if cid=$(docker create --pull never "$IMAGE" 2>/dev/null); then
+        img_out=$(docker cp "$cid:/out" - 2>/dev/null | tar -tvf - 2>/dev/null | head -5 | paste -sd ';' || true)
+        docker rm "$cid" >/dev/null 2>&1 || true
+    fi
+    echo "image /out   ${img_out:-none in the image}"
+    if (( STRICT )); then
+        echo "/out mount   $(findmnt -no SOURCE,FSTYPE,OPTIONS "$RUN_DIR/.mnt-out" 2>&1 || true)"
+    else
+        echo "/out mount   $(docker exec "$NAME-hold" grep ' /out ' /proc/mounts 2>&1 || true)"
+    fi
+    echo "/out before  $(out_owner)  (expected $OUT_EXPECTED)"
+fi
+
 # --- run --------------------------------------------------------------------
 
 echo
@@ -292,6 +329,11 @@ case $rc in
     127) report "exit code 0" no "exit=127: command not found - check ENTRYPOINT/CMD exist in the image" ;;
     *)   report "exit code 0" no "exit=$rc" ;;
 esac
+
+# The harness's own check: a FAIL here is ours or your Docker's, not your plugin's
+got=$(out_owner)
+report "/out still ${RUN_UID}:${RUN_GID} mode 2750 after the run" \
+    "$( [[ $got == "$OUT_EXPECTED" ]] && echo yes || echo no )" "got $got, expected $OUT_EXPECTED"
 
 RESULT="$OUT_DIR/result.json"
 if [[ -f $RESULT && ! -L $RESULT ]]; then
