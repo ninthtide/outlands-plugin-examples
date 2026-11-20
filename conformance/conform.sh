@@ -227,7 +227,10 @@ else
         docker volume create --driver local --opt type=tmpfs --opt device=tmpfs \
             --opt "o=size=${2}m,uid=$RUN_UID,gid=$RUN_GID,mode=$3,noexec,nosuid,nodev" \
             "$NAME-$1" >/dev/null
-        MOUNTS+=(-v "$NAME-$1:/$1")
+        # nocopy: once the holder has it mounted, an image's own /out or
+        # /scratch would copy its owner and mode onto the volume (root 0755).
+        # The platform bind-mounts, which never copies.
+        MOUNTS+=(-v "$NAME-$1:/$1:nocopy")
     }
     tmpfs_volume out "$OUT_MB" 2750
     (( SCRATCH_MB )) && tmpfs_volume scratch "$SCRATCH_MB" 0700
